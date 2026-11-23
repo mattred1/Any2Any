@@ -1,5 +1,7 @@
 # Suivi des correctifs communs
 
+**[Français](COMMON-FIXES.md) · [English](COMMON-FIXES.en.md)**
+
 Base reprise : main / 0.9.3 / 684c8867ac67b6f4752743d23c88040103b19a98.
 
 | Correctif | Commit main | Repris dans Notion | Validation |
@@ -76,3 +78,14 @@ Pour chaque futur correctif, noter le commit d’origine, les adaptations évent
 
 
 - Organisation 0.10.1 : dossier actif F:/Documents/ChatGPT/Anytwo/Any2Any, modules et static déplacés sous app, tests/outils/exemples/rapports privés regroupés sous dev. Lanceurs et imports de tests adaptés ; profils utilisateur inchangés. Archive source propre et distribution Windows x64 autonome (Any2Any.exe, _internal, documentation) ; contrôle de l’EXE après extraction avant publication, sans import réel. Réorganisation autorisée pour le local, GitHub et une nouvelle release, sans réécriture de 0.10.0.
+
+- Correctif commun `03e08b2` des mentions Anytype : `<mention object_id="…">Nom</mention>` devient un lien d’objet natif `any://o/…` dans le texte, les colonnes, les tableaux, les cases composées et la description. La découverte des liens reconnaît les cibles de mention ; elles rejoignent le périmètre lorsque l’option des éléments liés est active, sinon le libellé reste en texte brut avec un avertissement. Aucun backfill des pages déjà importées. Validation : 278 tests Python réussis, dont paragraphe, tableau, case composée, cible hors périmètre, libellé vide et simulation avec ou sans suivi des liens.
+
+- Correctif commun des propriétés techniques Anytype (23 novembre 2026) : `source_object`, `template_name_prefill_type` et les autres clés de comptabilité interne (`template_*`, `unique_key`, `cover_*`, `set_of`…) ne deviennent plus des colonnes Anytwo. Filtrage par clé et non par libellé, dans les valeurs, le schéma des types et les vues intégrées. Filet de sécurité : les colonnes portant ces noms dans les collections créées par l’import sont supprimées via `DELETE /collections/:id/properties/:propId` et listées dans `removed_properties` ; les collections réutilisées ne sont jamais nettoyées. Validation : 283 tests Python réussis, dont filtrage, schéma, artefacts et suppression simulée.
+
+- Interface bilingue (23 novembre 2026) : les libellés statiques des pages Anytype et Notion sont désormais tous traduits FR/EN/DE, y compris les attributs `title`, `placeholder` et `aria-label`. Les lignes dynamiques du journal et du bilan sont traduites par motifs (`Bilan : …`, `<nom> — partiel · 1 adaptation(s)`, préfixes « Contenu non reproduit : », « Erreur : », « ID Anytwo : », raisons de sélection, messages d’API) ; les données source (noms d’objets, identifiants, texte brut d’une API) restent intactes. La fenêtre d’import tient désormais dans la fenêtre du navigateur (`max-height` et défilement interne), sans zoom arrière. Tests : 286 Python dont deux contrôles i18n (dictionnaire et couverture du balisage).
+- Valeurs de propriétés (23 novembre 2026) : une valeur vide n’est plus écrite pour les formats url/email/phone/number/date, ce qui évitait l’erreur Anytwo `property.format_violation` sur la propriété « source ». Une adresse non absolue reste en texte. Test de régression ajouté.
+
+- Complément interface et erreurs (23 novembre 2026) : les messages du moteur (issues, erreurs API, progression, analyse) sont traduits par un catalogue de 144 gabarits, noms et identifiants réinsérés. Les colonnes de relation reçoivent toujours un tableau d’URI `any://`, ce qui supprime l’erreur `property.format_violation` sur les collections. Le serveur doit être redémarré après une mise à jour du module. Validation : 287 tests Python, simulation réelle en lecture seule entièrement en anglais, import simulé sans erreur (0 sur 237 objets).
+
+- Normalisation des relations (23 novembre 2026) : une valeur de relation stockée en liste JSON ou en identifiant brut est convertie en URI `any://` avant écriture ; une référence non importée est ignorée avec avertissement. Supprime l’erreur `link "[...]" must be a plain any://<objectId> URI` signalée sur la collection Regular. Validation : 288 tests Python et import simulé de la source réelle sans aucune erreur de propriété.

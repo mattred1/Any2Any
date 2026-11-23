@@ -1,5 +1,7 @@
 # Fidélité des imports — 29 octobre 2026
 
+**[Français](IMPORT-FIDELITE.fr.md) · [English](IMPORT-FIDELITE.en.md)**
+
 Cette passe améliore la fidélité des imports Anytype vers Anytwo. Les README ne contiennent pas de numéro de version.
 
 ## Propriétés
@@ -109,3 +111,39 @@ L’import d’un espace conserve aussi les collections comme pages de navigatio
 Les membres d’une collection importée reçoivent son supertag équivalent et leurs propriétés sont écrites directement dans celui-ci. Un objet membre de plusieurs collections garde ces appartenances ; les propriétés requises sont disponibles dans chacune. Le supertag du type source sert de repli pour les objets hors collection importée, ou de destination explicitement choisie pour un import par type. On ne rajoute plus automatiquement « Page » aux membres d’une collection. Les champs comptables n’apparaissent donc plus dans le supertag de repli de pages qui n’ont qu’un Tag.
 
 Une collection utilise la table native `dataviews/default` et sa première vue `views/default` (les suivantes restent dans la même table). Les propriétés visibles, masquées et leur ordre sont appliqués ; les tris se trouvent dans `query.sort` et dans `query.anyUi.sort`. Les dates source sont conservées dans une propriété de collection, distincte de la date de création de la copie importée. Le Tag peut être défini et renseigné tout en étant masqué dans cette vue. L’hôte de vues existant est réutilisé lors d’un import dans une collection existante. Les largeurs restent locales au client et sont archivées avec avertissement.
+
+## Mentions Anytype — correctif du 23 novembre 2026
+
+- Les mentions en ligne `@` exportées par Anytype sous la forme `<mention object_id="…">Nom</mention>` sont converties en liens d’objet natifs `[Nom](any://o/<espace>/<objet>)`, comme les liens Markdown `anytype://object?objectId=…`. Elles sont prises en charge dans les paragraphes, titres, listes, citations, colonnes, tableaux, cases de tableaux composés et le préfixe de description.
+- Les cibles de mention sont reconnues par la découverte des liens : elles sont importées automatiquement lorsque l’option « Importer également les éléments liés » est active. Avec l’option désactivée, la mention reste le nom affiché en texte brut et un avertissement explicite figure dans le rapport.
+- Une mention dont l’objet n’existe pas dans le périmètre importé conserve son libellé, sans balise visible, et produit l’avertissement « Mention vers un objet non importé ».
+- Le libellé utilise le texte de la mention, puis le nom d’objet connu, puis l’identifiant. Les entités HTML du libellé sont décodées.
+- Ces correctifs s’appliquent aux prochains imports ; les pages déjà copiées ne sont pas réparées automatiquement.
+
+## Propriétés techniques Anytype — correctif du 23 novembre 2026
+
+Anytype range sa comptabilité interne dans la même table de propriétés que les valeurs utilisateur. Ces clés ne sont jamais des colonnes créées par l’utilisateur :
+
+- `source_object` (provenance d’un objet importé dans Anytype) ;
+- `template_name_prefill_type` et toutes les clés préfixées `template_` (réglages de préremplissage des modèles) ;
+- `import_type`, `unique_key`, `default_template_id`, `default_type_id`, `default_view_type`, `size_in_bytes`, `deletion_change_id`, `internal_flags`, `featured_relations`, `recommended_relations`, `recommended_*_relations`, `recommended_layout`, `header_relations_layout`, `set_of`, `order_id`, `cover_*`, `icon_name`, `icon_option`, `plural_name`, `layout_width`.
+
+- Ces identifiants sont reconnus par **clé**, jamais par libellé : une propriété utilisateur dont le nom ressemble à « Source object » mais dont la clé est un identifiant généré reste importée.
+- Ils ne sont plus importés comme colonnes ni comme valeurs, y compris lorsqu’ils apparaissent dans le schéma d’un type ou dans les filtres d’une vue intégrée.
+- Filet de sécurité : à la fin de l’import, les colonnes portant ces noms dans les collections créées par cet import sont supprimées via `DELETE /v1/spaces/:spaceId/collections/:collectionId/properties/:propId`. Les collections de destination réutilisées ne sont pas nettoyées, afin de ne jamais supprimer une colonne existante de l’utilisateur. Les suppressions éventuelles figurent dans `removed_properties` du rapport JSON.
+- Les objets déjà importés ne sont pas réparés automatiquement : relancer un import crée de nouvelles copies.
+
+## Valeurs de propriétés vides ou non absolues — correctif du 23 novembre 2026
+
+- Une valeur vide (`""` ou espaces) n’est plus écrite pour les formats `url`, `email`, `phone`, `number` et `date`. Anytwo refusait la requête entière (`property.format_violation : url value "" must be an absolute URL with a scheme`), ce qui faisait échouer la propriété de la page. La valeur est désormais ignorée avec l’avertissement « Valeur vide ignorée pour la propriété … », sans colonne inutile.
+- Une adresse non absolue (sans schéma) est conservée en texte avec l’avertissement « Valeur non absolue pour … conservée en texte », au lieu d’être perdue ou de bloquer la page.
+- Les dates vides ne produisent plus de valeur `$date` invalide.
+- Ces correctifs s’appliquent aux prochains imports.
+
+## Valeurs de relation et messages traduits — complément du 23 novembre 2026
+
+- Une colonne de relation n’accepte qu’un tableau d’URI `any://<objectId>`. Les champs système repris pour les vues en ligne écrivent désormais un tableau, ou basculent en texte avec avertissement lorsque la cible n’est pas importée. L’erreur `property.format_violation : relation value must be an array …` sur les collections n’apparaît plus.
+- Second passage requis pour les valeurs vides : le serveur doit être redémarré après mise à jour, sinon l’ancien module reste en mémoire.
+- Les messages du journal et du bilan (issues, erreurs, progression, analyse) sont traduits par gabarits : les noms d’objets et les identifiants sont réinsérés tels quels. Un rapport entièrement anglais ne contient plus de texte français, hors données source.
+
+- Complément : une valeur de relation déjà stockée sous forme de liste JSON ou d’identifiant brut est normalisée en URI `any://` avant écriture. Une référence non importée est ignorée avec l’avertissement « Référence de relation non importée : valeur ignorée », au lieu de produire `link "[...]" must be a plain any://<objectId> URI`.

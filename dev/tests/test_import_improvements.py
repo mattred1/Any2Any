@@ -4,7 +4,9 @@ import unittest
 from unittest.mock import patch
 
 from api_clients import APIError, Anytype, anytype_property_definitions
-from migration import Engine, render_blocks, declared_column_shape, declared_properties, slug
+from migration import (Engine, render_blocks, declared_column_shape, declared_properties, slug,
+                       custom_properties, import_artifacts, internal_record_property, mapped_relation,
+                       relation_references)
 from view_conversion import (ViewConverter, UnsupportedView, enrich_descriptor,
                              create_saved_views, modify_records)
 
@@ -153,6 +155,38 @@ class FidelityTests(unittest.TestCase):
         self.assertIn('False',result)
         self.assertIn('0',result)
 
+    def test_mention_tags_become_native_object_links(self):
+        issues=set()
+        doc={'blocks':[{'type':'paragraph',
+            'text':'The <mention object_id="a">Magic 8 ball</mention> of it all, '
+                   "then <mention objectId='b'>Tom &amp; Jerry</mention>."}]}
+        result=render_blocks(doc,{'a':'new-a','b':'new-b'},'s',{'a':'Magic 8 ball','b':'Tom & Jerry'},
+                             False,None,issues)
+        self.assertIn('[Magic 8 ball](any://o/s/new-a)',result)
+        self.assertIn('[Tom & Jerry](any://o/s/new-b)',result)
+        self.assertNotIn('<mention',result)
+        self.assertFalse(issues)
+
+    def test_mentions_in_table_cells_and_compound_checkboxes(self):
+        doc={'blocks':[{'type':'table','rows':[{'cells':[
+            {'blocks':[{'type':'paragraph','text':'See <mention object_id="a">Alpha</mention>'}]},
+            {'type':'checkbox','checked':True,'text':'Check <mention object_id="a">Alpha</mention>'}]}]}]}
+        result=render_blocks(doc,{'a':'new-a'},'s',{'a':'Alpha'},False,None,set())
+        self.assertEqual(result.count('<a href="any://o/s/new-a">Alpha</a>'),2)
+        self.assertNotIn('<mention',result)
+
+    def test_unmapped_and_empty_label_mentions(self):
+        issues=set()
+        result=render_blocks({'blocks':[{'type':'paragraph',
+            'text':'Ask <mention object_id="gone">Former name</mention>.'}]},
+            {},'s',{'gone':'Current name'},False,None,issues)
+        self.assertEqual(result,'Ask Former name.')
+        self.assertIn('Mention vers un objet non importé',issues)
+        result=render_blocks({'blocks':[{'type':'paragraph',
+            'text':'See <mention object_id="x"></mention>.'}]},
+            {'x':'new-x'},'s',{'x':'Known name'},False,None,set())
+        self.assertIn('[Known name](any://o/s/new-x)',result)
+
     def test_date_less_filter_is_refused_when_empty_semantics_differ(self):
         with self.assertRaises(UnsupportedView):
             self.converter.predicate({'property':'Date','condition':'less','value':'2026-10-29'})
@@ -163,6 +197,129 @@ class FidelityTests(unittest.TestCase):
                 [{'id':'tag','name':'Ready','color':'teal'}]]):
             result=anytype_property_definitions(Anytype(1,'key'),'s')
         self.assertEqual(result['state']['options'][0]['color'],'teal')
+
+
+class ImportArtifactTests(unittest.TestCase):
+    """Anytype record bookkeeping must never become an Anytwo column."""
+
+    def test_bookkeeping_keys_are_recognized_by_identifier(self):
+        for key in ('source_object','template_name_prefill_type','template_anything',
+                    'import_type','cover_x','set_of'):
+            with self.subTest(key=key):
+                self.assertTrue(internal_record_property(key))
+        # A user property key is an id; a similar label is still user data.
+        self.assertFalse(internal_record_property('660578238cec08068e66a674'))
+        self.assertFalse(internal_record_property(''))
+
+    def test_custom_properties_drop_bookkeeping_and_keep_user_values(self):
+        doc={'properties':{'name':'Kitty','source_object':['bafy-x'],
+                           'template_name_prefill_type':1,'stars':['bafy-y']}}
+        self.assertEqual(custom_properties(doc),{'stars':['bafy-y']})
+
+    def test_type_schema_ignores_bookkeeping_definitions(self):
+        result=declared_properties({'property_definitions':[
+            {'property':'source_object','name':'Source object','format':'objects'},
+            {'property':'template_name_prefill_type','name':'template_name_prefill_type','format':'number'},
+            {'property':'abc123','name':'Mood','format':'select'}]}, {})
+        self.assertEqual([x['name'] for x in result],['Mood'])
+
+    def test_artifact_labels_use_the_source_vocabulary(self):
+        doc={'properties':{'source_object':['bafy-x'],'template_name_prefill_type':1,'stars':['bafy-y']},
+             'property_internal_keys':{}}
+        vocabulary={'source_object':{'name':'Source object','format':'objects'}}
+        self.assertEqual(import_artifacts(doc,vocabulary),
+                         {'Source object':'source_object',
+                          'template_name_prefill_type':'template_name_prefill_type'})
+
+    def test_engine_skips_artifact_columns_and_removes_leftovers(self):
+        class Source:
+            def object_detail(self, sid, oid):
+                return {'properties':{'name':'Kitty','source_object':['bafy-x'],
+                                      'template_name_prefill_type':1,'stars':['bafy-y']},
+                        'blocks':[{'type':'paragraph','text':'Body'}]}
+        kitty={'id':'k','name':'Kitty','type':'character'}
+        inventory={'all':[kitty],'objects':[kitty],'collections':[],'members':{},'standalone':[],
+                   'types':[{'id':'type-character','key':'character','name':'Characters','items':[kitty]}],
+                   'stats':{}}
+        plan={'source_space':{'id':'src','name':'Source'},'selection':{'kind':'space'},
+              'target':{'space_mode':'create','space_name':'Dest','collection_mode':'none','type_mappings':[]},
+              'mode':'simple','follow_links':False,'files':False}
+        vocabulary={'source_object':{'name':'Source object','format':'objects'},
+                    'template_name_prefill_type':{'format':'number'},
+                    'stars':{'name':'Player','format':'objects'}}
+        created=[]; target=object()
+        def add_column(target,sid,cid,name,xkey,kind,fmt):
+            created.append(name)
+            return 'prop-'+name
+        with patch('migration.create_space',return_value='dest'),\
+             patch('migration.create_collection',return_value='coll1'),\
+             patch('migration.create_object',return_value='new-k'),\
+             patch('migration.anytype_property_definitions',return_value=vocabulary),\
+             patch('migration.list_columns',return_value=[{'id':'p1','name':'Source object'}]),\
+             patch('migration.add_column',side_effect=add_column),\
+             patch('migration.set_column_value'),\
+             patch('migration.set_markdown'),\
+             patch('migration.delete_column') as delete:
+            events=list(Engine(Source(),target,inventory,plan).run())
+        summary=events[-1]
+        self.assertNotIn('Source object',created)
+        self.assertNotIn('template_name_prefill_type',created)
+        self.assertIn('Player',created)
+        delete.assert_called_once_with(target,'dest','coll1','p1')
+        self.assertEqual(summary['removed_properties'],
+                         [{'name':'Source object','collection_id':'coll1','property_id':'p1'}])
+
+    def test_empty_url_and_relative_url_values_do_not_fail_the_page(self):
+        class Source:
+            def object_detail(self, sid, oid):
+                return {'properties':{'name':'Trinket','source':''},
+                        'blocks':[{'type':'paragraph','text':'Body'}]}
+        trinket={'id':'t','name':'Trinket','type':'character'}
+        inventory={'all':[trinket],'objects':[trinket],'collections':[],'members':{},'standalone':[],
+                   'types':[{'id':'type-character','key':'character','name':'Characters','items':[trinket]}],
+                   'stats':{}}
+        plan={'source_space':{'id':'src','name':'Source'},'selection':{'kind':'space'},
+              'target':{'space_mode':'create','space_name':'Dest','collection_mode':'none','type_mappings':[]},
+              'mode':'simple','follow_links':False,'files':False}
+        created=[]
+        def add_column(target,sid,cid,name,xkey,kind,fmt):
+            created.append(name); return 'prop-'+name
+        with patch('migration.create_space',return_value='dest'),\
+             patch('migration.create_collection',return_value='coll1'),\
+             patch('migration.create_object',return_value='new-t'),\
+             patch('migration.anytype_property_definitions',return_value={'source':{'name':'Source','format':'url'}}),\
+             patch('migration.list_columns',return_value=[]),\
+             patch('migration.add_column',side_effect=add_column),\
+             patch('migration.set_column_value') as set_value,\
+             patch('migration.set_markdown'):
+            events=list(Engine(Source(),object(),inventory,plan).run())
+        summary=[event for event in events if event['event']=='summary'][-1]
+        self.assertNotIn('Source',created)
+        set_value.assert_not_called()
+        self.assertEqual(summary['objects'][0]['errors'],[])
+        self.assertIn('Valeur vide ignorée pour la propriété « Source »',summary['objects'][0]['issues'])
+
+
+    def test_relation_values_are_native_uri_arrays(self):
+        mapping={'a':'target-a','b':'target-b'}
+        self.assertEqual(mapped_relation(['a','b'],mapping),['any://target-a','any://target-b'])
+        self.assertEqual(mapped_relation('a',mapping),['any://target-a'])
+        # A single unmapped reference keeps the page usable: no relation array.
+        self.assertIsNone(mapped_relation(['a','gone'],mapping))
+        self.assertIsNone(mapped_relation([],mapping))
+        self.assertIsNone(mapped_relation('gone',mapping))
+
+
+    def test_stored_relation_values_are_normalized_before_writing(self):
+        mapping={'a':'target-a'}
+        self.assertEqual(relation_references('any://target-a',mapping),['any://target-a'])
+        self.assertEqual(relation_references('a',mapping),['any://target-a'])
+        # A JSON list of raw ids is what an unmapped relation leaves in the report.
+        self.assertEqual(relation_references('["a"]',mapping),['any://target-a'])
+        self.assertIsNone(relation_references('["gone"]',mapping))
+        self.assertIsNone(relation_references([],mapping))
+        self.assertIsNone(relation_references(['a',None],mapping))
+
 
 
 if __name__=='__main__':unittest.main()
