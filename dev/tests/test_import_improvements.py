@@ -6,7 +6,8 @@ from unittest.mock import patch
 from api_clients import APIError, Anytype, anytype_property_definitions
 from migration import (Engine, render_blocks, declared_column_shape, declared_properties, slug,
                        custom_properties, import_artifacts, internal_record_property, mapped_relation,
-                       relation_references)
+                       relation_references, write_markdown_with_embeds)
+from rich_content import legacy_markup, envelopes_supported
 from view_conversion import (ViewConverter, UnsupportedView, enrich_descriptor,
                              create_saved_views, modify_records)
 
@@ -235,7 +236,7 @@ class ImportArtifactTests(unittest.TestCase):
         class Source:
             def object_detail(self, sid, oid):
                 return {'properties':{'name':'Kitty','source_object':['bafy-x'],
-                                      'template_name_prefill_type':1,'stars':['bafy-y']},
+                                      'template_name_prefill_type':1,'stars':['k']},
                         'blocks':[{'type':'paragraph','text':'Body'}]}
         kitty={'id':'k','name':'Kitty','type':'character'}
         inventory={'all':[kitty],'objects':[kitty],'collections':[],'members':{},'standalone':[],
@@ -319,6 +320,90 @@ class ImportArtifactTests(unittest.TestCase):
         self.assertIsNone(relation_references('["gone"]',mapping))
         self.assertIsNone(relation_references([],mapping))
         self.assertIsNone(relation_references(['a',None],mapping))
+
+
+    def test_envelopes_degrade_to_plain_markdown(self):
+        doc={'blocks':[{'type':'toggle','text':'Secret stash'},
+                       {'type':'paragraph','indent':1,'text':'Hidden note'},
+                       {'type':'toggle_heading_2','text':'Open question'},
+                       {'type':'paragraph','indent':1,'text':'Answer'}]}
+        native=render_blocks(doc,{},'s',{},False,None,set())
+        self.assertIn('<!-- any:collapsible {"open":false} -->',native)
+        plain=legacy_markup(native)
+        self.assertNotIn('<!--',plain)
+        self.assertIn('**Secret stash**',plain)
+        self.assertIn('Hidden note',plain)
+        self.assertIn('## Open question',plain)
+
+    def test_layout_embed_and_image_envelopes_are_stripped(self):
+        markdown='\n\n'.join(['<!-- any:columns {"widths":[1,1]} -->','<!-- any:column -->','Left',
+                              '<!-- any:column -->','Right','<!-- /any:columns -->',
+                              '<!-- any:block {"kind":"embed"} -->','[Vidéo](https://youtu.be/x)',
+                              '<!-- /any:block {"instance":"i"} -->','![p](file:///a.png)<!-- any:image-width=320 -->'])
+        plain=legacy_markup(markdown)
+        self.assertNotIn('<!--',plain)
+        self.assertEqual(plain, 'Left\n\nRight\n\n[Vidéo](https://youtu.be/x)\n\n![p](file:///a.png)')
+
+    def test_envelope_support_follows_the_client_version(self):
+        self.assertTrue(envelopes_supported(()))
+        self.assertTrue(envelopes_supported((0,4,9)))
+        self.assertFalse(envelopes_supported((0,5,0)))
+        self.assertFalse(envelopes_supported((0,5,2)))
+
+    def test_write_path_drops_markers_when_the_client_rejects_them(self):
+        written=[]
+        with patch('migration.set_markdown',side_effect=lambda *a: written.append(a[-1])):
+            write_markdown_with_embeds(object(),'s','o','<!-- any:collapsible {"open":false} -->\n\nTitle\n\n'
+                                       '<!-- any:collapsible-content -->\n\nBody\n\n<!-- /any:collapsible -->',
+                                       [],set(),markers=True)
+            write_markdown_with_embeds(object(),'s','o','<!-- any:collapsible {"open":false} -->\n\nTitle\n\n'
+                                       '<!-- any:collapsible-content -->\n\nBody\n\n<!-- /any:collapsible -->',
+                                       [],set(),markers=False)
+        self.assertIn('<!-- any:collapsible',written[0])
+        self.assertEqual(written[1],'**Title**\n\nBody')
+
+    def _relation_columns(self, adventure):
+        class Source:
+            def object_detail(self, sid, oid):
+                return {'properties':{'name':'Sigil','adventure':adventure},
+                        'blocks':[{'type':'paragraph','text':'Body'}]}
+        item={'id':'i','name':'Sigil','type':'character'}
+        other={'id':'0','name':'Other','type':'character'}
+        inventory={'all':[item,other],'objects':[item,other],'collections':[],'members':{},'standalone':[],
+                   'types':[{'id':'t','key':'character','name':'Characters','items':[item,other]}],'stats':{}}
+        plan={'source_space':{'id':'src','name':'Source'},'selection':{'kind':'space'},
+              'target':{'space_mode':'create','space_name':'Dest','collection_mode':'none','type_mappings':[]},
+              'mode':'simple','follow_links':False,'files':False}
+        created=[]; written=[]; ids=iter(['new-i','new-0'])
+        def add_column(target,sid,cid,name,xkey,kind,fmt):
+            created.append((name,kind,(fmt or {}).get('type')))
+            return 'prop-'+name
+        with patch('migration.create_space',return_value='dest'),\
+             patch('migration.create_collection',return_value='coll1'),\
+             patch('migration.create_object',side_effect=lambda *a, **k: next(ids)),\
+             patch('migration.anytype_property_definitions',
+                   return_value={'adventure':{'name':'Mystery','format':'objects'}}),\
+             patch('migration.list_columns',return_value=[]),\
+             patch('migration.add_column',side_effect=add_column),\
+             patch('migration.set_column_value',side_effect=lambda *a: written.append(a[-1])),\
+             patch('migration.set_markdown'):
+            list(Engine(Source(),object(),inventory,plan).run())
+        return created,written
+
+    def test_unmapped_relation_does_not_create_a_text_duplicate(self):
+        created,written=self._relation_columns(['gone'])
+        self.assertFalse(any('(Anytype)' in name for name,_,_ in created))
+        # Every target is missing: no column and no value are created at all.
+        self.assertEqual(created,[])
+        self.assertEqual(written,[])
+
+    def test_partially_mapped_relation_keeps_only_imported_targets(self):
+        created,written=self._relation_columns(['0', 'gone'])
+        self.assertFalse(any('(Anytype)' in name for name,_,_ in created))
+        self.assertIn(('Mystery','array','relation'),created)
+        # Only the imported target survives; the unknown reference is dropped.
+        self.assertTrue(written)
+        self.assertTrue(all(v==['any://new-0'] for v in written), written)
 
 
 
