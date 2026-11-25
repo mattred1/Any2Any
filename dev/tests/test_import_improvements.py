@@ -7,7 +7,7 @@ from api_clients import APIError, Anytype, anytype_property_definitions
 from migration import (Engine, render_blocks, declared_column_shape, declared_properties, slug,
                        custom_properties, import_artifacts, internal_record_property, mapped_relation,
                        relation_references, write_markdown_with_embeds)
-from rich_content import legacy_markup, envelopes_supported
+from rich_content import legacy_markup, envelopes_supported, feature_envelope_supported
 from view_conversion import (ViewConverter, UnsupportedView, enrich_descriptor,
                              create_saved_views, modify_records)
 
@@ -57,7 +57,7 @@ class FidelityTests(unittest.TestCase):
     def test_unknown_filter_refuses_entire_view(self):
         for bad in ({'property':'Unknown','condition':'equal','value':1},
                     {'property':'Date','condition':'equal','date_preset':'today'},
-                    {'property':'Status','condition':'empty'},
+                    {'property':'Status','condition':'unknown'},
                     {'property':'Related','condition':'in','value':['missing']}):
             with self.subTest(bad=bad),self.assertRaises(UnsupportedView):
                 self.converter.convert({'filters':[bad]}, {'id':{'$in':['new-a']}})
@@ -204,13 +204,17 @@ class ImportArtifactTests(unittest.TestCase):
     """Anytype record bookkeeping must never become an Anytwo column."""
 
     def test_bookkeeping_keys_are_recognized_by_identifier(self):
-        for key in ('source_object','template_name_prefill_type','template_anything',
+        for key in ('source_object','template_name_prefill_type',
                     'import_type','cover_x','set_of'):
             with self.subTest(key=key):
                 self.assertTrue(internal_record_property(key))
         # A user property key is an id; a similar label is still user data.
         self.assertFalse(internal_record_property('660578238cec08068e66a674'))
         self.assertFalse(internal_record_property(''))
+        # The template_ prefix is never a system signal: a custom property
+        # whose key merely starts with template_ is user data.
+        self.assertFalse(internal_record_property('template_notes'))
+        self.assertFalse(internal_record_property('template_anything'))
 
     def test_custom_properties_drop_bookkeeping_and_keep_user_values(self):
         doc={'properties':{'name':'Kitty','source_object':['bafy-x'],
@@ -232,7 +236,7 @@ class ImportArtifactTests(unittest.TestCase):
                          {'Source object':'source_object',
                           'template_name_prefill_type':'template_name_prefill_type'})
 
-    def test_engine_skips_artifact_columns_and_removes_leftovers(self):
+    def test_engine_skips_artifact_columns_and_preserves_homonymous_leftovers(self):
         class Source:
             def object_detail(self, sid, oid):
                 return {'properties':{'name':'Kitty','source_object':['bafy-x'],
@@ -266,9 +270,175 @@ class ImportArtifactTests(unittest.TestCase):
         self.assertNotIn('Source object',created)
         self.assertNotIn('template_name_prefill_type',created)
         self.assertIn('Player',created)
-        delete.assert_called_once_with(target,'dest','coll1','p1')
-        self.assertEqual(summary['removed_properties'],
-                         [{'name':'Source object','collection_id':'coll1','property_id':'p1'}])
+        # A homonymous leftover column is never deleted by display name.
+        delete.assert_not_called()
+        self.assertNotIn('removed_properties',summary)
+
+    def test_custom_properties_keep_a_template_prefixed_user_key(self):
+        doc={'properties':{'name':'Kitty','template_notes':'A user note',
+                           'template_name_prefill_type':1}}
+        self.assertEqual(custom_properties(doc, {}),
+                         {'template_notes':'A user note'})
+
+    def test_custom_label_with_custom_identity_is_not_a_system_property(self):
+        doc={'properties':{'Source object':['bafy-x'],'notes':'A note'},
+             'property_internal_keys':{'Source object':'660578238cec08068e66a674'}}
+        self.assertEqual(custom_properties(doc, {}),
+                         {'Source object':['bafy-x'],'notes':'A note'})
+
+    def test_system_identity_under_a_custom_label_is_excluded(self):
+        doc={'properties':{'Prefill':1,'notes':'A note'},
+             'property_internal_keys':{'Prefill':'template_name_prefill_type'}}
+        self.assertEqual(custom_properties(doc, {}), {'notes':'A note'})
+        self.assertEqual(import_artifacts(doc),
+                         {'template_name_prefill_type':'template_name_prefill_type'})
+
+    def test_declared_properties_keep_a_custom_identity_with_a_system_like_label(self):
+        result=declared_properties({'property_definitions':[
+            {'property':'abc123','name':'Source object','format':'text'},
+            {'property':'source_object','name':'Source object','format':'objects'}]}, {})
+        self.assertEqual([x['key'] for x in result], ['abc123'])
+
+    def test_label_keyed_property_is_kept_when_the_vocabulary_describes_a_custom_entry(self):
+        # No alias map: the document keys the property by its label.
+        doc={'properties':{'Source object':['bafy-x']}}
+        vocabulary={'source object':{'name':'Source object','key':'abc123','format':'objects'}}
+        self.assertEqual(custom_properties(doc,vocabulary),{'Source object':['bafy-x']})
+
+    def test_label_keyed_system_property_is_still_dropped(self):
+        doc={'properties':{'Source object':['bafy-x']}}
+        vocabulary={'source object':{'name':'Source object','key':'source_object','format':'objects',
+                                     'hidden':True}}
+        self.assertEqual(custom_properties(doc,vocabulary),{})
+
+    def test_cleanup_compares_identities_exactly(self):
+        from migration import Engine
+        engine=Engine.__new__(Engine)
+        engine.target=object(); engine.dest_sid='dest'
+        engine.created_columns=[
+            {'source_key':'source-object','collection_id':'c1','property_id':'p-dash','label':'Source object'}]
+        engine.report={}
+        with patch('migration.delete_column') as delete:
+            engine.remove_import_artifacts([{'properties':{'source_object':['x']}}], {})
+        delete.assert_not_called()
+
+    def test_artifact_cleanup_only_deletes_tracked_system_columns(self):
+        # A user column labelled like a system field must survive cleanup.
+        from migration import Engine
+        engine=Engine.__new__(Engine)
+        engine.target=object(); engine.dest_sid='dest'
+        engine.created_columns=[
+            {'source_key':'abc123','collection_id':'c1','property_id':'p-user','label':'Source object'},
+            {'source_key':'source_object','collection_id':'c1','property_id':'p-sys','label':'Source object'}]
+        engine.report={}
+        docs=[{'properties':{'source_object':['x']}}]
+        vocabulary={'source_object':{'name':'Source object','format':'objects'}}
+        with patch('migration.delete_column') as delete:
+            removed=engine.remove_import_artifacts(docs, vocabulary)
+        delete.assert_called_once_with(engine.target,'dest','c1','p-sys')
+        self.assertEqual(removed,[{'name':'Source object','collection_id':'c1','property_id':'p-sys'}])
+
+    def test_property_tracks_the_source_identity_end_to_end(self):
+        from migration import Engine
+        engine=Engine.__new__(Engine)
+        engine.target=object(); engine.dest_sid='dest'
+        engine.prop_cache={}; engine.col_cache={}; engine.created_columns=[]
+        engine.inv={'types':[]}; engine.report={}
+        with patch('migration.list_columns',return_value=[]),\
+             patch('migration.add_column',return_value='p1'),\
+             patch('migration.delete_column') as delete:
+            pid,_=engine.property('c1','Source object','text','x',set(),{},
+                                  source_key='source_object')
+            removed=engine.remove_import_artifacts(
+                [{'properties':{'source_object':['x']}}],
+                {'source_object':{'name':'Source object','format':'objects'}})
+        self.assertEqual(pid,'p1')
+        self.assertEqual(engine.created_columns[0]['source_key'],'source_object')
+        delete.assert_called_once_with(engine.target,'dest','c1','p1')
+        self.assertEqual(removed[0]['property_id'],'p1')
+
+    def test_property_without_a_source_identity_is_not_tracked_for_cleanup(self):
+        from migration import Engine
+        engine=Engine.__new__(Engine)
+        engine.target=object(); engine.dest_sid='dest'
+        engine.prop_cache={}; engine.col_cache={}; engine.created_columns=[]
+        engine.inv={'types':[]}
+        with patch('migration.list_columns',return_value=[]),\
+             patch('migration.add_column',return_value='p1'):
+            engine.property('c1','Source object','text','x',set(),{})
+        self.assertEqual(engine.created_columns,[])
+
+    def test_engine_call_sites_never_track_a_display_label(self):
+        # A user property with no source identity must be created but not
+        # tracked under its label; with an identity it must track that identity.
+        class Source:
+            def object_detail(self, sid, oid):
+                return {'properties':{'name':'Kitty','Notes':'A note'},
+                        'blocks':[{'type':'paragraph','text':'Body'}]}
+        kitty={'id':'k','name':'Kitty','type':'character'}
+        inventory={'all':[kitty],'objects':[kitty],'collections':[],'members':{},'standalone':[],
+                   'types':[{'id':'type-character','key':'character','name':'Characters','items':[kitty]}],
+                   'stats':{}}
+        plan={'source_space':{'id':'src','name':'Source'},'selection':{'kind':'space'},
+              'target':{'space_mode':'create','space_name':'Dest','collection_mode':'none','type_mappings':[]},
+              'mode':'simple','follow_links':False,'files':False}
+        created=[]
+        def add_column(target,sid,cid,name,xkey,kind,fmt):
+            created.append(name);return 'prop-'+name
+        with patch('migration.create_space',return_value='dest'),\
+             patch('migration.create_collection',return_value='coll1'),\
+             patch('migration.create_object',return_value='new-k'),\
+             patch('migration.anytype_property_definitions',return_value={'notes':{'name':'Notes','format':'text'}}),\
+             patch('migration.list_columns',return_value=[]),\
+             patch('migration.add_column',side_effect=add_column),\
+             patch('migration.set_column_value'),\
+             patch('migration.set_markdown'),\
+             patch('migration.delete_column') as delete:
+            engine=Engine(Source(),object(),inventory,plan)
+            list(engine.run())
+        self.assertIn('Notes',created)
+        # Without a resolved identity the column is created but never tracked,
+        # so a label can never become a cleanup identity.
+        self.assertEqual(engine.created_columns,[])
+        delete.assert_not_called()
+
+    def test_engine_tracks_a_resolved_property_identity(self):
+        class Source:
+            def object_detail(self, sid, oid):
+                return {'properties':{'name':'Kitty','Notes':'A note'},
+                        'blocks':[{'type':'paragraph','text':'Body'}]}
+        kitty={'id':'k','name':'Kitty','type':'character'}
+        inventory={'all':[kitty],'objects':[kitty],'collections':[],'members':{},'standalone':[],
+                   'types':[{'id':'type-character','key':'character','name':'Characters','items':[kitty]}],
+                   'stats':{}}
+        plan={'source_space':{'id':'src','name':'Source'},'selection':{'kind':'space'},
+              'target':{'space_mode':'create','space_name':'Dest','collection_mode':'none','type_mappings':[]},
+              'mode':'simple','follow_links':False,'files':False}
+        with patch('migration.create_space',return_value='dest'),\
+             patch('migration.create_collection',return_value='coll1'),\
+             patch('migration.create_object',return_value='new-k'),\
+             patch('migration.anytype_property_definitions',
+                   return_value={'notes':{'name':'Notes','key':'abc123','format':'text'}}),\
+             patch('migration.list_columns',return_value=[]),\
+             patch('migration.add_column',return_value='prop-Notes'),\
+             patch('migration.set_column_value'),\
+             patch('migration.set_markdown'),\
+             patch('migration.delete_column') as delete:
+            engine=Engine(Source(),object(),inventory,plan)
+            list(engine.run())
+        self.assertEqual([row['source_key'] for row in engine.created_columns],['abc123'])
+        delete.assert_not_called()
+
+    def test_untranslated_template_settings_are_reported(self):
+        from migration import Engine
+        engine=Engine.__new__(Engine)
+        engine.target=object(); engine.dest_sid='dest'
+        engine.created_columns=[]; engine.report={}
+        engine.remove_import_artifacts(
+            [{'properties':{'template_name_prefill_type':1,'default_template_id':'x'}}], {})
+        reported=engine.report['template_settings_not_translated']
+        self.assertIn('template_name_prefill_type',reported)
+        self.assertIn('default_template_id',reported)
 
     def test_empty_url_and_relative_url_values_do_not_fail_the_page(self):
         class Source:
@@ -334,6 +504,44 @@ class ImportArtifactTests(unittest.TestCase):
         self.assertIn('**Secret stash**',plain)
         self.assertIn('Hidden note',plain)
         self.assertIn('## Open question',plain)
+
+    def test_legacy_markup_preserves_fenced_markers(self):
+        markdown='Before\n\n```html\n<!-- any:block {"kind":"embed"} -->\n```\n\nAfter'
+        self.assertEqual(legacy_markup(markdown),
+                         'Before\n\n```html\n<!-- any:block {"kind":"embed"} -->\n```\n\nAfter')
+
+    def test_legacy_markup_preserves_longer_and_tilde_fences(self):
+        longer='````md\n```\n<!-- any:block {"kind":"embed"} -->\n```\n````'
+        self.assertEqual(legacy_markup(longer),longer)
+        tildes='~~~\n<!-- any:block {"kind":"embed"} -->\n~~~'
+        self.assertEqual(legacy_markup(tildes),tildes)
+
+    def test_legacy_markup_protects_an_unclosed_fence(self):
+        markdown='Intro\n```\n<!-- any:block {"kind":"embed"} -->\nnever closed'
+        self.assertEqual(legacy_markup(markdown),markdown)
+
+    def test_legacy_markup_still_strips_envelopes_outside_fences(self):
+        markdown='<!-- any:columns {"widths":[1,1]} -->\n\n```\n<!-- kept -->\n```'
+        plain=legacy_markup(markdown)
+        self.assertNotIn('any:columns',plain)
+        self.assertIn('<!-- kept -->',plain)
+
+    def test_legacy_markup_preserves_native_toc(self):
+        toc=('<!-- any:block {"v":1,"kind":"table-of-contents","schema":1,'
+             '"instance":"i1","data":{}} -->\n\n\n\n<!-- /any:block {"instance":"i1"} -->')
+        markdown='Intro\n\n'+toc+'\n\nOutro'
+        plain=legacy_markup(markdown)
+        self.assertIn(toc,plain)
+        self.assertIn('Intro',plain)
+        self.assertIn('Outro',plain)
+
+    def test_feature_envelope_support_is_per_feature(self):
+        self.assertTrue(feature_envelope_supported((0,5,0),'table-of-contents'))
+        self.assertFalse(feature_envelope_supported((0,5,0),'collapsible'))
+        self.assertFalse(feature_envelope_supported((0,5,0),'columns'))
+        self.assertFalse(feature_envelope_supported((0,5,0),'embed'))
+        self.assertTrue(feature_envelope_supported((0,4,9),'collapsible'))
+        self.assertFalse(feature_envelope_supported((0,3,6),'table-of-contents'))
 
     def test_layout_embed_and_image_envelopes_are_stripped(self):
         markdown='\n\n'.join(['<!-- any:columns {"widths":[1,1]} -->','<!-- any:column -->','Left',

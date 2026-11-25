@@ -13,12 +13,13 @@ from copy import deepcopy
 from rich_content import (ImportedFile, inline_html, native_columns, native_toggle,
                           descendant_end, rebase, depth as block_depth, youtube_markdown,
                           file_html, file_anchor_html, checkbox_html, remove_unsupported_inline, image_markdown,
-                          image_width, legacy_markup, envelopes_supported)
+                          image_width, legacy_markup, envelopes_supported, feature_envelope_supported)
 from file_transfer import FileLibrary, strip_import_prefix
 from view_conversion import (choice_options, enrich_descriptor, ViewConverter,
                              create_saved_views, modify_records, UnsupportedView)
 from source_views import SourceViews, source_value, MISSING, is_recent_widget_document, is_recent_widget_block, RECENT_WIDGET_TARGETS
 from inline_views import instance_id, inline_markdown, inline_records, property_names
+from anytype_templates import Templates, is_template
 import html
 import json
 import mimetypes
@@ -46,6 +47,7 @@ SYSTEM |= {'id', 'type', 'object_type', 'layout', 'icon', 'cover', 'description'
            'resolved_layout', 'origin', 'created_in_context', 'created_in_context_ref',
            'layout_align', 'is_archived', 'sync_status', 'import_type',
            'image_kind', 'participant_permissions', 'participant_status'}
+SYSTEM |= {'source_object', 'sourceobject'}
 TEXT = {'paragraph':'', 'heading_1':'# ', 'heading_2':'## ', 'heading_3':'### ',
         'quote':'> ', 'bulleted_list_item':'- ', 'numbered_list_item':'1. '}
 KNOWN_UNSUPPORTED = {
@@ -160,62 +162,105 @@ INTERNAL_RECORD_PROPERTIES = frozenset({
     'cover_id', 'cover_type', 'cover_x', 'cover_y', 'cover_scale',
     'icon_name', 'icon_option', 'plural_name', 'layout_width',
 })
-# Anytype template internals share this prefix; user property keys are ids.
-INTERNAL_RECORD_PREFIXES = ('template_',)
+# Anytype template internals that carry record settings rather than user values.
+TEMPLATE_SETTING_KEYS = frozenset({'default_template_id', 'default_type_id', 'default_view_type'})
+
+
+def _normalized_key(value):
+    return str(value or '').replace('-', '_').replace(' ', '_').casefold()
+
+
+def property_identity(doc, name):
+    """Authoritative Anytype identity of a property key or label.
+
+    `property_internal_keys` maps a human label to the real internal key. When
+    it does, that key is the identity and the label must never be compared with
+    the system-name list; a custom property may legitimately be called
+    "Source object" while its identity is a generated id.
+    """
+    aliases = (doc or {}).get('property_internal_keys') or {}
+    alias = aliases.get(name)
+    return str(alias if alias is not None else (name or ''))
 
 
 def internal_record_property(identifier):
-    """True for Anytype record bookkeeping keys that are never user columns."""
-    key = str(identifier or '').replace('-', '_').replace(' ', '_').casefold()
-    return bool(key) and (key in INTERNAL_RECORD_PROPERTIES
-                          or key.startswith(INTERNAL_RECORD_PREFIXES))
+    """True for Anytype record bookkeeping keys that are never user columns.
+
+    Matching is by the explicit set of identifiers Anytype itself declares.
+    User property keys are generated ids and may share a display label with a
+    system field, so a `template_` prefix is never a signal of system origin.
+    """
+    key = _normalized_key(identifier)
+    return bool(key) and key in INTERNAL_RECORD_PROPERTIES
 
 
 def import_artifacts(doc, vocabulary=None):
-    """Labels of bookkeeping properties present in a source document.
+    """Verified system identities present in a source document.
 
-    Only identifiers Anytype itself declares are returned, so a same-named
-    user column is never reported as an artifact.
+    Only identifiers Anytype itself declares are returned, resolved through
+    `property_internal_keys`, so a same-named user property is never reported
+    as an artifact.
     """
     props = doc.get('properties')
     if not isinstance(props, dict): return {}
-    aliases = doc.get('property_internal_keys') or {}
     found = {}
     for key in props:
-        if not internal_record_property(key): continue
-        internal = str(aliases.get(key) or key)
-        meta = (vocabulary or {}).get(internal.casefold()) or {}
-        found[str(meta.get('name') or internal)] = internal
+        identity = property_identity(doc, key)
+        if not _is_system_identity(identity, key, vocabulary): continue
+        meta = (vocabulary or {}).get(_normalized_key(identity)) or {}
+        found[str(meta.get('name') or identity)] = identity
     return found
+
+
+def _system_meta(meta):
+    """True when a vocabulary entry declares a system/hidden/internal property."""
+    if not isinstance(meta, dict):
+        return False
+    if any(meta.get(flag) is True for flag in ('hidden','is_hidden','isHidden',
+                                               'system','is_system','isSystem',
+                                               'internal','is_internal','isInternal')):
+        return True
+    return _normalized_key(meta.get('internal_key')) in SYSTEM
+
+
+def _is_system_identity(identity, name, vocabulary=None):
+    """True when this identity is a verified Anytype system property.
+
+    A document may key properties by label. Without a `property_internal_keys`
+    alias, the vocabulary disambiguates: an entry describing a custom property
+    (different key/id, no system flag) keeps the label-keyed value.
+    """
+    key = _normalized_key(identity)
+    if not (internal_record_property(identity) or key in SYSTEM):
+        return False
+    if str(identity) != str(name or ''):
+        return True
+    meta = (vocabulary or {}).get(str(name or '').casefold()) or {}
+    identities = {_normalized_key(meta.get(field))
+                  for field in ('key','id','internal_key') if meta.get(field)}
+    return not (identities and key not in identities and not _system_meta(meta))
 
 
 def internal_property(name, vocabulary=None, doc=None):
     """Exclude documented system keys and explicitly hidden Anytype metadata.
 
-    Never use a generic `unknown` format as a reason to discard user data.
+    Classification uses the resolved identity, never a display label whose
+    alias points at a custom property. Never use a generic `unknown` format as
+    a reason to discard user data.
     """
-    key = str(name).replace('-', '_').replace(' ', '_').casefold()
-    alias = (doc or {}).get('property_internal_keys') or {}
-    internal = str(alias.get(name) or '').replace('-', '_').casefold()
-    if key in SYSTEM or internal in SYSTEM:
+    identity = property_identity(doc, name)
+    if _is_system_identity(identity, name, vocabulary):
         return True
     vocab = vocabulary or {}
-    meta = vocab.get(key) or vocab.get(internal) or {}
-    if not isinstance(meta, dict):
-        return False
-    if any(meta.get(flag) is True for flag in ('hidden','is_hidden','isHidden',
-                                             'system','is_system','isSystem',
-                                             'internal','is_internal','isInternal')):
-        return True
-    return str(meta.get('internal_key') or '').casefold() in SYSTEM
+    meta = vocab.get(str(name or '').casefold()) or vocab.get(_normalized_key(identity)) or {}
+    return _system_meta(meta)
 
 
 def custom_properties(doc, vocabulary=None):
     props = doc.get('properties')
     if not isinstance(props, dict): return {}
     return {str(key): value for key, value in props.items()
-            if not internal_record_property(key) and not internal_property(key, vocabulary, doc)
-            and value is not None}
+            if not internal_property(key, vocabulary, doc) and value is not None}
 
 
 def is_bookmark(obj, doc=None):
@@ -385,16 +430,8 @@ def reference_link(ref, mapping, target_sid, names):
 
 
 def replace_inline_links(text, mapping, sid, names, issues):
-    # AnyBlock inline links use Markdown with anytype://object?objectId=<id>.
-    def old_url(m):
-        oid = unquote(m.group(2))
-        new = reference_link(oid, mapping, sid, names)
-        if not new:
-            issues.add('Lien vers un objet non importé')
-            return m.group(0)
-        return m.group(1) + new
-    text = re.sub(r'(\]\()anytype://object\?objectId=([^)& ]+)', old_url, str(text))
-    # Anytype serialises inline @ mentions as tags Anytwo would display raw.
+    # Anytype serialises inline @ mentions as HTML-like tags the client would
+    # otherwise display verbatim. Both object_id and objectId are accepted.
     def mention(match):
         oid = unquote((match.group(1) or match.group(2) or '').strip())
         label = html.unescape(match.group(3)).strip() or str(names.get(oid) or oid)
@@ -403,7 +440,18 @@ def replace_inline_links(text, mapping, sid, names, issues):
             issues.add('Mention vers un objet non importé')
             return label
         return titled_link(label, uri)
-    return INLINE_MENTION_RE.sub(mention, text)
+    text = INLINE_MENTION_RE.sub(mention, str(text))
+    # AnyBlock inline links use Markdown with anytype://object?objectId=<id>.
+    def old_url(m):
+        params = parse_qs(m.group(2).replace(r'\&', '&'))
+        oid = (params.get('objectId') or [''])[0]
+        new = reference_link(oid, mapping, sid, names)
+        if not new:
+            issues.add('Lien vers un objet non importé')
+            return m.group(0)
+        return m.group(1) + new + ')'
+    text = re.sub(r'(\]\()anytype://object\?([^\s)]+)\)', old_url, text)
+    return text
 
 
 def _nested_fragment(blocks, mapping=None, sid=None, names=None, issues=None,
@@ -713,7 +761,7 @@ def render_blocks(doc, mapping, sid, names, files_allowed, file_import, issues, 
         elif typ == 'any2any_property':
             lines.append(block['markdown'])
         elif typ == 'any2any_toc':
-            lines.append(block['marker'])
+            lines.append(block.get('markdown') or block['marker'])
         elif typ == 'any2any_inline_view':
             lines.append(block['markdown'])
             if block.get('failed'):lines.append(notice('notice.secondary_views'))
@@ -850,6 +898,20 @@ def column_shape(fmt, value, issues):
     return 'string', {'type':'longtext'}, json.dumps(value,ensure_ascii=False) if not isinstance(value,str) else value
 
 
+def date_has_time(value):
+    if isinstance(value, dict):
+        value = value.get('$date')
+    if not isinstance(value, str) or 'T' not in value:
+        return False
+    try:
+        instant = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if instant.tzinfo:
+            instant = instant.astimezone(timezone.utc)
+        return bool(instant.hour or instant.minute or instant.second or instant.microsecond)
+    except ValueError:
+        return True
+
+
 
 def declared_properties(type_document, vocabulary):
     """Read actual Anytype v2 type schema, including columns without values."""
@@ -863,11 +925,10 @@ def declared_properties(type_document, vocabulary):
         if not isinstance(raw, dict): continue
         key = str(raw.get('property') or raw.get('key') or raw.get('name') or '').strip()
         if not key: continue
-        meta = vocabulary.get(key.casefold()) or {}
+        identity = str(raw.get('internal_key') or key)
+        meta = vocabulary.get(_normalized_key(identity)) or vocabulary.get(key.casefold()) or {}
         label = str(raw.get('name') or meta.get('name') or key)
-        normalized = label.casefold().replace('-', '_').replace(' ', '_')
-        if (internal_record_property(key) or internal_record_property(raw.get('internal_key'))
-                or internal_property(label, vocabulary) or internal_property(key, vocabulary)
+        if (internal_record_property(identity) or internal_property(identity, vocabulary)
                 or key.casefold() in seen):
             continue
         fmt = str(raw.get('format') or meta.get('format') or 'text').casefold()
@@ -884,7 +945,7 @@ def declared_column_shape(spec):
         return 'string', {'type':fmt}
     if fmt == 'number': return 'number', {'type':'number'}
     if fmt == 'checkbox': return 'boolean', {'type':'checkbox'}
-    if fmt == 'date': return 'datetime', {'type':'date'}
+    if fmt == 'date': return 'datetime', {'type':'datetime' if spec.get('_requires_datetime') else 'date'}
     if fmt == 'objects': return 'array', {'type':'relation','config':{'multiple':True}}
     if fmt in ('select','multi_select'):
         opts=choice_options(spec.get('options') or [], slug)
@@ -906,6 +967,9 @@ class Engine:
         self.memberships={}
         self.property_bindings={}
         self.written_properties={}
+        self.created_columns=[]
+        self.property_previews={}
+        self.type_names={str(t.get('key')):t.get('name') for t in inventory['types']}
         self.source_views=SourceViews(source,self.sid,inventory)
         self.collection_documents={}
         self.view_reports=[]
@@ -913,6 +977,7 @@ class Engine:
         self.widget_warnings = set()
         self.native_markup=True
         self.language=language(plan.get('language'))
+        self.templates = Templates(self)
         self.type_defs={}; self.collection_reports=[]; self.results={}; self.report={'status':'running','objects':[],'errors':[], 'warnings':{},'created':{}}
         self.names={obj['id']:obj['name'] for obj in inventory['all']}
 
@@ -921,9 +986,10 @@ class Engine:
         issues=Counter(issue for r in self.results.values() for issue in r['issues'])
         issues.update(issue for cr in self.collection_reports for issue in cr['issues'])
         issues.update(self.widget_warnings)
+        issues.update(self.templates.warnings)
         if error:
             self.report['errors'].append(str(error))
-        self.report['status']=status or ('done' if not counters['error'] and not counters['partial'] and not self.widget_warnings else 'partial')
+        self.report['status']=status or ('done' if not counters['error'] and not counters['partial'] and not self.widget_warnings and not self.templates.warnings else 'partial')
         self.report['objects']=[{'name':r['name'],'source_id':oid,'target_id':r['target_id'],
                                  'status':r['status'],'reason':r['reason'],
                                  'issues':sorted(r['issues']),'errors':r['errors']}
@@ -948,35 +1014,33 @@ class Engine:
     def remove_import_artifacts(self, documents, vocabulary):
         """Drop Anytwo columns that only mirror Anytype import bookkeeping.
 
-        Only identifiers the source itself declares are matched, and only
-        importer-created collections are cleaned, so user columns are never
-        touched. Returns the removed columns for the report.
+        Deletion eligibility is never inferred from a display name: a column
+        is only removed when this import created it and its exact source
+        property identity is a verified system field. Columns created by this
+        import are tracked in `created_columns` with their source key.
         """
         artifacts = {}
         for doc in documents:
             artifacts.update(import_artifacts(doc, vocabulary))
         if not artifacts: return []
-        names = {label.casefold() for label in artifacts}
-        names.update(key.casefold() for key in artifacts.values())
+        template_settings = {key for key in artifacts.values()
+                             if _normalized_key(key).startswith('template_')
+                             or _normalized_key(key) in TEMPLATE_SETTING_KEYS}
+        if template_settings:
+            self.report.setdefault('template_settings_not_translated', []).extend(sorted(template_settings))
+        identities = {str(key).casefold() for key in artifacts.values()}
         removed = []
-        created = {cid for cid in self.col_cache.values() if cid not in self.existing_collections}
-        for cid in sorted(created):
+        for column in self.created_columns:
+            source = str(column.get('source_key') or '').casefold()
+            if not source or source not in identities: continue
+            cid = column['collection_id']; prop_id = column['property_id']
             try:
-                columns = list_columns(self.target, self.dest_sid, cid)
-            except (APIError, ValueError, TypeError, KeyError):
+                delete_column(self.target, self.dest_sid, cid, prop_id)
+            except (APIError, ValueError, TypeError) as exc:
+                self.report.setdefault('artifact_warnings', []).append(
+                    f'Colonne technique « {column["label"]} » non supprimée : {exc}')
                 continue
-            for column in columns:
-                label = str(column.get('name') or '')
-                if label.casefold() not in names: continue
-                prop_id = str(column.get('id') or '')
-                if not prop_id: continue
-                try:
-                    delete_column(self.target, self.dest_sid, cid, prop_id)
-                except (APIError, ValueError, TypeError) as exc:
-                    self.report.setdefault('artifact_warnings', []).append(
-                        f'Colonne technique « {label} » non supprimée : {exc}')
-                    continue
-                removed.append({'name': label, 'collection_id': cid, 'property_id': prop_id})
+            removed.append({'name': column['label'], 'collection_id': cid, 'property_id': prop_id})
         return removed
 
     def import_widgets(self, entries, docs):
@@ -991,7 +1055,7 @@ class Engine:
             if (target and not is_conversation(item) and not is_bookmark(item, doc)
                     and item.get('type') not in (FILE_TYPES | {'set', 'query', 'object_type', 'template'})
                     and item.get('layout') not in FILE_TYPES
-                    and 'query_source' not in doc and doc.get('kind') not in ('object_type', 'template')):
+                    and 'query_source' not in doc and doc.get('kind') != 'object_type' and not is_template(doc)):
                 pages[source_id] = target
         if not pages and not collections:
             return []
@@ -1043,6 +1107,28 @@ class Engine:
         self.col_cache[key]=cid
         return cid
 
+    def register_source_collections(self, docs):
+        """Resolve structural collection references before creating page objects."""
+        for source_id, doc in list(docs.items()):
+            candidates = [(source_id, doc)]
+            for block in doc.get('blocks') or []:
+                if not isinstance(block, dict) or block.get('type') != 'dataview' or not block.get('object_id'):
+                    continue
+                try:
+                    host, _, _ = self.source_views.resolve(doc, block)
+                    candidates.append((block['object_id'], host))
+                except (APIError, UnsupportedView, ValueError, KeyError, TypeError):
+                    continue
+            for ref, host in candidates:
+                if host.get('type') != 'collection' and host.get('type_internal_key') != 'collection':
+                    continue
+                self.collection_documents.setdefault(ref, host)
+                name = (host.get('properties') or {}).get('name') or self.names.get(ref) or 'Collection Anytype'
+                self.mapping[ref] = self.col('collection:'+ref, name)
+                self.names[ref] = name
+                if not any(row.get('source_id') == ref for row in self.collection_reports):
+                    self.collection_reports.append({'source_id':ref, 'name':name, 'issues':[]})
+
     def type_column(self, key, name, *, force=False):
         target = self.plan['target']
         typmap = next((x for x in (target.get('type_mappings') or []) if x.get('key')==key),None)
@@ -1054,7 +1140,7 @@ class Engine:
             return None
         return self.col('type:'+key, name)
 
-    def property(self, cid, name, fmt, value, issues, metadata, override=None):
+    def property(self, cid, name, fmt, value, issues, metadata, override=None, source_key=None):
         kind, form = override if override else column_shape(fmt, value, issues)[:2]
         meta=metadata.get(name.casefold(), {})
         saved=json.loads((form.get('any2any') or {}).get('sourceSettings') or '{}')
@@ -1088,6 +1174,10 @@ class Engine:
             issues.add(f'Propriété « {name} » : même nom mais format différent dans la collection cible')
             name += ' (Anytype)'
         pid = add_column(self.target,self.dest_sid,cid,name,slug(name,(cid,name,fmt)),kind,form)
+        # Track the exact source identity so cleanup can never match a label.
+        if source_key:
+            self.created_columns.append({'source_key':source_key,'collection_id':cid,
+                                         'property_id':pid,'label':name})
         self.prop_cache[key]=(pid,form)
         return self.prop_cache[key]
 
@@ -1137,7 +1227,13 @@ class Engine:
                 if name not in names:names.append(name)
         for name in names:
             if name.casefold()=='name':continue
-            if name!='type' and internal_record_property(name):continue
+            declared=next((v for v in block.get('properties',[]) if str(v.get('property','')).casefold()==name.casefold()),{})
+            source_spec=converter.metadata.get(name.casefold()) or declared
+            if name!='type':
+                identity=str(source_spec.get('internal_key') or source_spec.get('key') or source_spec.get('id') or '')
+                if identity and internal_record_property(identity):continue
+            if source_spec.get('format') == 'files':
+                continue
             candidates=[] if name=='type' else converter.bindings.get(name.casefold(),[])
             if included:
                 owners={owner for oid in included for owner in self.memberships.get(oid,set())}
@@ -1159,7 +1255,8 @@ class Engine:
                     else:
                         kind=declared_column_shape({**spec,'format':spec.get('format') or 'text'})[0]
                         pid,actual=self.property(scope,str(spec.get('name') or name),spec.get('format') or 'text',None,issues,converter.metadata,
-                            override=(kind,deepcopy(form)))
+                            override=(kind,deepcopy(form)),
+                            source_key=str(spec.get('internal_key') or spec.get('key') or spec.get('id') or '') or None)
                         target_binding=(scope+'.'+pid,spec,actual)
                     for oid in included:
                         values=[]
@@ -1191,6 +1288,9 @@ class Engine:
             for oid in included:
                 doc=self.source_views.document(oid)
                 value=source_value(doc,name,self.source_views.items.get(oid))
+                if name == 'type' and value is not MISSING:
+                    value = self.type_names.get(str(value)) or next(
+                        (t.get('name') for t in self.inv['types'] if str(value) in (str(t.get('id')), str(t.get('key')))), str(value))
                 if value is not MISSING:found.append((oid,value))
             declared=next((v for v in block.get('properties',[]) if str(v.get('property','')).casefold()==name.casefold()),{})
             spec=deepcopy(converter.metadata.get(name.casefold()) or declared)
@@ -1209,9 +1309,10 @@ class Engine:
                     spec['format']='text';fmt='text';references=[]
             spec.update(format=fmt,name=spec.get('name') or name)
             kind,form=declared_column_shape(spec)
-            if fmt=='date' and found and any('T00:00:00' not in str(column_shape(fmt,v,issues)[2].get('$date','')) for _,v in found):
+            if fmt=='date' and found and any(date_has_time(v) for _,v in found):
                 form['type']='datetime'
-            pid,actual=self.property(scope,spec['name'],fmt,found[0][1] if found else None,issues,converter.metadata,override=(kind,form))
+            pid,actual=self.property(scope,spec['name'],fmt,found[0][1] if found else None,issues,converter.metadata,override=(kind,form),
+                source_key=str(spec.get('internal_key') or spec.get('key') or spec.get('id') or '') or None)
             bindings[name.casefold()]=[(scope+'.'+pid,spec,actual)]
             for index,(oid,value) in enumerate(found):
                 converted=references[index] if fmt=='objects' else column_shape(fmt,value,issues)[2]
@@ -1275,14 +1376,14 @@ class Engine:
                 reference=block.get('object_id')
                 block['views']=views
                 table_key=instance_id(target_id,str(block.get('id') or block_index))
-                if target_id in self.mapping.values():
+                if target_id != self.col_cache.get('collection:'+source_id):
                     scope,scoped_converter=self.inline_scope(source_id,block,source_ids,converter,issues)
                     records,failed=inline_records(scoped_converter,block,scope,table_key,issues,
                         native_layouts=getattr(self, 'destination_version', ()) >= (0, 3, 6))
                     view_id=self.view_hosts.get(target_id)
                     if view_id is None:
                         root=target_write(self.target,f'/spaces/{_segment(self.dest_sid)}/objects',{
-                            'type':'dataview','initialProperties':{'any':{'name':'Vues Anytype'},'dataview':{'host':target_id}}})
+                            'type':'dataview','initialProperties':{'dataview':{'host':target_id}}})
                         view_id=root.get('objectId')
                     if not view_id:raise APIError('Objet de vues créé sans identifiant')
                     modify_records(self.target,self.dest_sid,view_id,'dataviews',[
@@ -1417,6 +1518,9 @@ class Engine:
         roots, reasons, selected_cols = select_scope(inv,plan)
         entries, docs, read_errors = discover_documents(self.source,self.sid,inv,roots,reasons,bool(plan.get('follow_links')) and plan['selection']['kind']!='space',self.source_views)
         if not docs and entries: raise APIError('Aucun document source lisible. Aucune écriture effectuée.')
+        self.templates.discover(entries, docs, reasons, selected_cols)
+        if len(entries) > MAX_OBJECTS:
+            raise APIError(f'Plus de {MAX_OBJECTS} objets, templates inclus. Aucune écriture effectuée.')
         yield self.emit('message',message=f'Lecture de {len(docs)} objets source · {len(read_errors)} avertissement(s).')
         try: metadata = anytype_property_definitions(self.source,self.sid)
         except APIError as exc:
@@ -1430,7 +1534,16 @@ class Engine:
             try:
                 detail = self.source.type_detail(self.sid,key) if hasattr(self.source,'type_detail') else {}
                 if not isinstance(detail,dict): detail = {}
+                label=(detail.get('properties') or {}).get('name')
+                if label:
+                    self.type_names[key]=label
+                    self.type_names[str(typ.get('id'))]=label
                 defs = declared_properties(detail,metadata)
+                for spec in defs:
+                    if spec.get('format') == 'date':
+                        spec['_requires_datetime'] = any(
+                            date_has_time(source_value(doc, spec['key'])) or date_has_time(source_value(doc, spec['name']))
+                            for oid, doc in docs.items() if entries[oid].get('type') == key)
                 if not defs and detail.get('property_definitions') is None:
                     yield self.emit('message', message=f'! Schéma du type « {typ["name"]} » incomplet : les colonnes sans valeur peuvent manquer.')
             except APIError as exc:
@@ -1454,21 +1567,22 @@ class Engine:
                     self.view_reports.append({'source_id':col['id'],'source':source_col,'status':'unsupported','error':'Filtres hors vue structurée'})
             except (APIError,TypeError,ValueError,KeyError):
                 col_issues.add('Configuration avancée de la collection source non vérifiable')
-            self.collection_reports.append({'name':col['name'], 'issues':sorted(col_issues)})
+            self.collection_reports.append({'source_id':col['id'], 'name':col['name'], 'issues':sorted(col_issues)})
             cid = self.col('collection:'+col['id'],
                            target.get('collection_name') or col['name'] if len(selected_cols)==1 else col['name'],
                            target.get('collection_id') if len(selected_cols)==1 and target.get('collection_mode')=='existing' else None)
             yield self.emit('message',message=f'Collection « {col["name"]} » → {cid}')
+        self.register_source_collections(docs)
         types_by_obj={obj['id']:typ for typ in inv['types'] for obj in typ['items']}
         member_cols={oid:[] for oid in docs}
-        for col in selected_cols:
-            cid=self.col_cache.get('collection:'+col['id'])
-            source_ids=set(self.collection_documents.get(col['id'],{}).get('collection_items',[]))
-            source_ids.update(item['id'] for item in inv['members'].get(col['id'],[]))
+        for source_id, source_doc in self.collection_documents.items():
+            cid=self.col_cache.get('collection:'+source_id)
+            source_ids=set(source_doc.get('collection_items',[]))
+            source_ids.update(item['id'] for item in inv['members'].get(source_id,[]))
             for member_id in source_ids:
                 if member_id in member_cols:member_cols[member_id].append(cid)
         # First pass: all pages and their collection memberships (no relations yet).
-        for oid, obj in entries.items():
+        for oid, obj in sorted(entries.items(), key=lambda item:item[0] in self.templates.rows):
             self.results[oid]={'name':obj['name'],'source_id':oid,'target_id':None,
                                'reason':reasons.get(oid,['Lié indirectement à la sélection']),
                                'issues':set(), 'errors':[], 'status':'pending'}
@@ -1478,9 +1592,15 @@ class Engine:
                 self.results[oid]['status']='error'
                 self.results[oid]['errors'].append('Objet source non lisible')
                 continue
-            props = {} if is_bookmark(obj,docs[oid]) else custom_properties(docs[oid],metadata); typ = types_by_obj.get(oid)
+            if oid in self.collection_documents:
+                self.results[oid]['target_id']=self.col_cache['collection:'+oid]
+                self.results[oid]['status']='created'
+                continue
+            props = {} if is_bookmark(obj,docs[oid]) else custom_properties(docs[oid],metadata)
+            template = oid in self.templates.rows
+            typ = None if template else types_by_obj.get(oid)
             typkey=(typ or {}).get('key') or obj.get('type') or 'page'
-            cols=list(member_cols.get(oid,[]))
+            cols=self.templates.scopes(oid, entries) if template else list(member_cols.get(oid,[]))
             # Existing source collection memberships own the properties. A type
             # collection is only a fallback for objects outside source collections.
             type_col=None
@@ -1500,7 +1620,10 @@ class Engine:
                 icon = docs[oid].get('icon') or {}
                 emoji = str(icon.get('emoji') or '') if isinstance(icon,dict) and icon.get('format')=='emoji' else (icon if isinstance(icon,str) else '')
                 icon_warnings=[]
-                if emoji:
+                if template:
+                    from anytwo_backend import create_template
+                    self.mapping[oid]=create_template(self.target,self.dest_sid,obj['name'],cols,emoji=emoji or None)
+                elif emoji:
                     self.mapping[oid]=create_object(self.target,self.dest_sid,obj['name'],cols,
                                                     emoji=emoji,icon_warnings=icon_warnings)
                     self.results[oid]['issues'].update(icon_warnings)
@@ -1533,9 +1656,12 @@ class Engine:
                 defined_owners.add(cid)
                 issues=self.results[oid]['issues']
                 for spec in defs:
+                    if spec['format'] == 'files':
+                        continue
                     try:
                         pid,form=self.property(cid,spec['name'],spec['format'],None,issues,metadata,
-                                      override=(declared_column_shape(spec)[0], enrich_descriptor(spec, declared_column_shape(spec)[1], issues)))
+                                      override=(declared_column_shape(spec)[0], enrich_descriptor(spec, declared_column_shape(spec)[1], issues)),
+                                      source_key=str(spec.get('internal_key') or spec.get('key') or spec.get('id') or '') or None)
                         for alias in (spec['key'],spec['name'],spec.get('id'),spec.get('internal_key')):
                             if alias:
                                 binding=(cid+'.'+pid,spec,form)
@@ -1548,6 +1674,8 @@ class Engine:
         for oid,doc in docs.items():
             r = self.results[oid]
             if not r['target_id']: continue
+            if oid in self.collection_documents:
+                continue
             props={} if is_bookmark(entries[oid],doc) else custom_properties(doc,metadata)
             cols=member_cols.get(oid,[])
             for name,value in props.items():
@@ -1559,6 +1687,26 @@ class Engine:
                 meta={**meta, **declared}
                 fmt=str(meta.get('format') or fmt).casefold()
                 label=str(meta.get('name') or name)
+                if fmt == 'files':
+                    values=value if isinstance(value,list) else [value]
+                    preview=[]
+                    for fid in values:
+                        if not isinstance(fid,str):
+                            r['errors'].append(f'Fichier de propriété « {name} » : ID invalide')
+                            continue
+                        if not plan.get('files'):
+                            r['issues'].add('Fichiers de propriété non repris (option désactivée)')
+                            continue
+                        try:
+                            uri=self.add_file(oid,fid,label+'-'+fid[:10],None)
+                            preview.append(image_markdown(uri,getattr(uri,'name',label))
+                                if getattr(uri,'mime','').startswith('image/') else file_html(uri,getattr(uri,'name',label)))
+                        except APIError as exc:
+                            r['errors'].append(f'Fichier de propriété « {name} » : {exc}')
+                    if preview:
+                        self.property_previews.setdefault(oid,[]).append('**'+label+'**\n\n'+'\n\n'.join(preview))
+                        r['issues'].add('Propriété fichier « '+label+' » : contenu placé en début de page')
+                    continue
                 if not cols:
                     r['errors'].append(f'Propriété « {name} » sans collection de destination')
                     continue
@@ -1574,21 +1722,6 @@ class Engine:
                     fmt='text'
                 primary=self.property_owner.get(oid) or cols[0]
                 try:
-                    if fmt=='files':
-                        values=value if isinstance(value,list) else [value]
-                        urls=[]
-                        for fid in values:
-                            if not isinstance(fid,str):
-                                r['errors'].append(f'Fichier de propriété « {name} » : ID invalide')
-                                continue
-                            if not plan.get('files'):
-                                r['issues'].add('Fichiers de propriété non repris (option désactivée)')
-                                continue
-                            try:
-                                urls.append(self.add_file(oid, fid, str(name)+'-'+fid[:10],None))
-                            except APIError as exc:
-                                r['errors'].append(f'Fichier de propriété « {name} » : {exc}')
-                        fmt='text';value='\n'.join(urls)
                     if fmt=='objects':
                         values=value if isinstance(value,list) else [value]
                         kept=[v for v in values if isinstance(v,str) and v in self.mapping]
@@ -1610,10 +1743,11 @@ class Engine:
                     if fmt in ('select','multi_select') and meta.get('options') is not None:
                         form=declared_column_shape({**meta,'format':fmt})[1]
                     form=enrich_descriptor({**meta,'format':fmt,'name':label}, form, r['issues'])
-                    if fmt=='date' and form.get('type')=='date' and isinstance(converted,dict) and 'T00:00:00' not in converted.get('$date',''):
+                    if fmt=='date' and form.get('type')=='date' and date_has_time(converted):
                         form['type']='datetime'
                     pid,actual_form=self.property(primary,label,fmt,value,r['issues'],metadata,
-                                                  override=(kind,form))
+                                                  override=(kind,form),
+                                                  source_key=str(meta.get('internal_key') or meta.get('key') or '') or None)
                     if fmt in ('select','multi_select'):
                         # Options must be extended in a later pass if the column pre-exists.
                         options=actual_form.setdefault('options',{}) if isinstance(actual_form,dict) else {}
@@ -1639,6 +1773,7 @@ class Engine:
                         'form':deepcopy(actual_form),'value':deepcopy(converted)}
                 except (APIError,KeyError,ValueError,TypeError) as exc:
                     r['errors'].append(f'Propriété « {name} » : {exc}')
+        self.templates.mirror_values()
         # Third pass: views and page bodies use the complete property/id mapping.
         converter=ViewConverter(self.property_bindings,self.mapping,
             {k[5:]:v for k,v in self.col_cache.items() if k.startswith('type:')},metadata,anytype_controls=True)
@@ -1654,11 +1789,18 @@ class Engine:
                 except (UnsupportedView,APIError,ValueError,TypeError,KeyError) as exc:
                     issues.add('Propriétés de collection non reproduites : '+str(exc))
             self.convert_views(source_doc,cid,scoped,issues,source_id)
-            report=next((r for r in self.collection_reports if r['name']==next((c['name'] for c in selected_cols if c['id']==source_id),None)),None)
+            if source_id in self.results:
+                self.results[source_id]['issues'].update(issues)
+            report=next((r for r in self.collection_reports if r.get('source_id') == source_id),None)
             if report is not None: report['issues']=sorted(set(report['issues'])|issues)
         for oid,doc in docs.items():
             r=self.results[oid]
             if not r['target_id']: continue
+            if oid in self.collection_documents:
+                r['status']='partial' if r['issues'] or r['errors'] else 'imported'
+                yield self.emit('object',name=r['name'],source_id=oid,target_id=r['target_id'],
+                    status=r['status'],reason=r['reason'],issues=sorted(r['issues']),errors=r['errors'])
+                continue
             props=custom_properties(doc,metadata)
             doc=self.convert_views(doc,r['target_id'],converter,r['issues'],oid)
             self.resolve_file_links(doc.get('blocks') or [])
@@ -1666,12 +1808,17 @@ class Engine:
             self.convert_property_blocks(doc,oid,issues)
             toc_tokens = set()
             if self.destination_version >= (0, 4, 1):
-                from notion_native import marker, replace_toc_markers
+                from notion_native import marker, replace_toc_markers, envelope
                 for index, block in enumerate(doc.get('blocks') or []):
                     if isinstance(block, dict) and block.get('type') in ('table_of_contents','tableOfContents'):
                         token = marker('toc', oid, str(block.get('id') or index))
-                        toc_tokens.add(token)
-                        block.update(type='any2any_toc', marker=token)
+                        if (block_depth(block) == 0
+                                and feature_envelope_supported(self.destination_version, 'table-of-contents')):
+                            block.update(type='any2any_toc', markdown=envelope(
+                                'table-of-contents', instance_id(oid, str(block.get('id') or index)), {}, ''))
+                        else:
+                            toc_tokens.add(token)
+                            block.update(type='any2any_toc', marker=token)
             cover=doc.get('cover')
             cover_line=''
             if isinstance(cover,dict) and cover.get('format')=='image' and cover.get('file'):
@@ -1686,8 +1833,6 @@ class Engine:
                     issues.add('Couverture image non importée (option fichiers désactivée)')
             elif cover:
                 issues.add('Couverture Anytype non reproduite')
-            if doc.get('kind') == 'template':
-                issues.add('Template importé comme une page ordinaire')
             query_missing = ('query_source' in doc or bool(doc.get('views'))) and not any(
                 b.get('type') in ('dataview', 'any2any_inline_view', 'any2any_saved_view')
                 for b in doc.get('blocks', []) if isinstance(b, dict)
@@ -1730,6 +1875,8 @@ class Engine:
             # value is attempted at object creation; never duplicate it here.
             if cover_line:
                 markdown='\n\n'.join(x for x in (cover_line,markdown) if x)
+            if self.property_previews.get(oid):
+                markdown='\n\n'.join([*self.property_previews[oid],markdown])
             if query_missing:
                 markdown += '\n\n'+notice('notice.dynamic_views')
             description=(doc.get('properties') or {}).get('description') if isinstance(doc.get('properties'),dict) else None
@@ -1757,6 +1904,8 @@ class Engine:
                         fallback=markdown
                     if cover_line:
                         fallback='\n\n'.join(x for x in (cover_line,fallback) if x)
+                    if self.property_previews.get(oid):
+                        fallback='\n\n'.join([*self.property_previews[oid],fallback])
                     try:
                         set_markdown(self.target,self.dest_sid,r['target_id'],self.page_markdown(fallback))
                         r['issues'].add('Rendu riche rejeté par Anytwo : version simplifiée importée')
@@ -1801,6 +1950,9 @@ class Engine:
                 r['status']='partial' if r['issues'] else 'imported'
             except (APIError,ValueError,TypeError,KeyError) as exc:r['errors'].append(str(exc))
             yield self.emit('object',**{**r,'issues':sorted(r['issues'])})
+        self.templates.defaults(entries, docs)
+        for warning in sorted(self.templates.warnings):
+            yield self.emit('message', message='! '+warning)
         removed = self.remove_import_artifacts(list(docs.values()), metadata)
         if removed:
             self.report['removed_properties'] = removed

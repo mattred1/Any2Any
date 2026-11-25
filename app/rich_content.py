@@ -68,27 +68,98 @@ def native_toggle(block,children,render,title):
                          '<!-- /any:collapsible -->'])
 
 
+def feature_envelope_supported(version, feature):
+    """Whether this client interprets a native envelope kind natively.
+
+    Anytwo 0.5 stores HTML comments as generic html blocks, so the collapsible,
+    columns and embed envelopes become visible page text. The native dynamic
+    table-of-contents block is interpreted from 0.4.1 and remains valid there.
+    An unknown or unexpected version keeps native envelopes untouched.
+    """
+    if not version or isinstance(version, (str, bytes)):
+        return True
+    try:
+        parsed = tuple(int(part) for part in version)
+    except (TypeError, ValueError):
+        return True
+    if feature == 'table-of-contents':
+        return parsed >= (0, 4, 1)
+    return parsed < (0, 5, 0)
+
+
 def envelopes_supported(version):
-    """Anytwo 0.5 shows HTML comment envelopes as visible html blocks."""
-    return not (version and tuple(version) >= (0, 5, 0))
+    """True when every legacy envelope feature is still interpreted natively."""
+    return all(feature_envelope_supported(version, feature)
+               for feature in ('collapsible', 'columns', 'embed'))
 
 
 ENVELOPE_COMMENT_RE=re.compile(r'[ \t]*<!--\s*/?\s*any:[^\n]*?-->[ \t]*')
 COLLAPSIBLE_ENVELOPE_RE=re.compile(
     r'<!--\s*any:collapsible\s[^\n]*?-->[ \t]*\n+[ \t]*([^\n]+?)[ \t]*\n+[ \t]*<!--\s*any:collapsible-content\s*-->')
+FENCE_OPEN_RE=re.compile(r'^[ \t]*(`{3,}|~{3,})([^\n]*)$')
+TOC_ENVELOPE_OPEN_RE=re.compile(r'^[ \t]*<!--\s*any:block\s+[^\n]*?"table-of-contents"[^\n]*?-->[ \t]*$')
+
+
+def _protected_blocks(lines):
+    """Split lines into literal blocks the fallback must not rewrite.
+
+    Fenced code (3+ backticks or tildes, closed by the same character and at
+    least the same length) and native dynamic table-of-contents envelopes are
+    returned as (start, end) index ranges. An unclosed fence protects the rest
+    of the document, so a stray fence can never expose markers to stripping.
+    """
+    ranges=[];index=0
+    while index<len(lines):
+        opening=FENCE_OPEN_RE.match(lines[index])
+        if opening and not (opening.group(1)[0]=='`' and '`' in opening.group(2)):
+            char=opening.group(1)[0];length=len(opening.group(1))
+            closing=re.compile(r'^[ \t]*'+re.escape(char)+r'{'+str(length)+r',}[ \t]*$')
+            end=index+1
+            while end<len(lines) and not closing.match(lines[end]):end+=1
+            end=min(end+1,len(lines))
+            ranges.append((index,end));index=end;continue
+        if TOC_ENVELOPE_OPEN_RE.match(lines[index]):
+            end=index+1
+            while end<len(lines) and not re.match(r'^[ \t]*<!--\s*/any:block',lines[end]):end+=1
+            end=min(end+1,len(lines))
+            ranges.append((index,end));index=end;continue
+        index+=1
+    return ranges
 
 
 def legacy_markup(markdown):
-    """Rewrite native envelopes as plain Markdown for clients without markers.
+    """Rewrite unsupported envelopes as plain Markdown for newer clients.
 
     Anytwo 0.5 stores HTML comments as generic html blocks instead of the native
-    collapsible, columns and embed nodes, so an envelope would be displayed as
-    page text. Toggle titles stay visible as bold titles or headings.
+    collapsible, columns and embed nodes, so those envelopes would be displayed
+    as page text. Toggle titles stay visible as bold titles or headings, while
+    fenced code and the native dynamic table-of-contents block are preserved
+    verbatim.
     """
     def toggle(match):
         title=match.group(1)
         return title if title.startswith('#') else '**'+title+'**'
-    text=COLLAPSIBLE_ENVELOPE_RE.sub(toggle,str(markdown))
+    lines=str(markdown).split('\n')
+    ranges=_protected_blocks(lines)
+    if not ranges:
+        return _legacy_markup_text(str(markdown),toggle)
+    def sentinel(position):
+        # A NUL-delimited token cannot appear in Markdown source text.
+        return '\x00any2any-protected-'+str(position)+'\x00'
+    pieces=[];cursor=0
+    for position,(start,end) in enumerate(ranges):
+        pieces.append('\n'.join(lines[cursor:start]))
+        pieces.append(sentinel(position))
+        cursor=end
+    pieces.append('\n'.join(lines[cursor:]))
+    text=_legacy_markup_text('\n'.join(pieces),toggle)
+    for position,(start,end) in enumerate(ranges):
+        text=text.replace(sentinel(position),'\n'.join(lines[start:end]))
+    return text
+
+
+def _legacy_markup_text(markdown,toggle):
+    text=COLLAPSIBLE_ENVELOPE_RE.sub(toggle,markdown)
     text=ENVELOPE_COMMENT_RE.sub('',text)
     return re.sub(r'\n{3,}','\n\n',text).strip('\n')
 
